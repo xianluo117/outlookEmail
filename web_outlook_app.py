@@ -13,6 +13,7 @@ import sqlite3
 import os
 import hashlib
 import secrets
+import hmac
 from datetime import datetime
 from email.header import decode_header
 from typing import Optional, List, Dict, Any
@@ -26,6 +27,7 @@ app.secret_key = os.urandom(24)
 
 # 登录密码配置（可以修改为你想要的密码）
 LOGIN_PASSWORD = "admin123"
+DEFAULT_API_AUTH_KEY = ""
 
 # ==================== 配置 ====================
 # Token 端点
@@ -181,6 +183,11 @@ def init_db():
         INSERT OR IGNORE INTO settings (key, value)
         VALUES ('gptmail_api_key', ?)
     ''', (GPTMAIL_API_KEY,))
+
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('api_auth_key', ?)
+    ''', (DEFAULT_API_AUTH_KEY,))
     
     conn.commit()
     conn.close()
@@ -228,6 +235,25 @@ def get_gptmail_api_key() -> str:
     """获取 GPTMail API Key（优先从数据库读取）"""
     api_key = get_setting('gptmail_api_key')
     return api_key if api_key else GPTMAIL_API_KEY
+
+
+def get_api_auth_key() -> str:
+    """获取 API 访问密钥"""
+    return get_setting('api_auth_key', DEFAULT_API_AUTH_KEY)
+
+
+def has_api_auth_key() -> bool:
+    """是否已配置 API 访问密钥"""
+    return bool(get_api_auth_key().strip())
+
+
+def verify_api_auth_key(api_key: str) -> bool:
+    """校验 API 访问密钥"""
+    expected = get_api_auth_key().strip()
+    provided = (api_key or '').strip()
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(expected, provided)
 
 
 # ==================== 分组操作 ====================
@@ -668,13 +694,49 @@ def get_email_detail_imap(account: str, client_id: str, refresh_token: str, mess
 
 # ==================== 登录验证 ====================
 
+def get_request_api_key() -> str:
+    """从请求中提取 API Key"""
+    auth_header = request.headers.get('Authorization', '').strip()
+    if auth_header.lower().startswith('bearer '):
+        return auth_header[7:].strip()
+
+    return (
+        request.headers.get('X-API-Key', '').strip()
+        or request.args.get('api_key', '').strip()
+    )
+
+
+def api_key_required(f):
+    """API Key 鉴权装饰器"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get('logged_in'):
+            return f(*args, **kwargs)
+
+        configured = has_api_auth_key()
+        provided_key = get_request_api_key()
+
+        if configured and verify_api_auth_key(provided_key):
+            return f(*args, **kwargs)
+
+        return jsonify({
+            'success': False,
+            'error': 'API 鉴权失败',
+            'need_login': True,
+            'need_api_key': True,
+            'auth_methods': ['session', 'api_key']
+        }), 401
+    return decorated_function
+
+
 def login_required(f):
     """登录验证装饰器"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        if request.path.startswith('/api/'):
+            return api_key_required(f)(*args, **kwargs)
+
         if not session.get('logged_in'):
-            if request.is_json or request.path.startswith('/api/'):
-                return jsonify({'success': False, 'error': '请先登录', 'need_login': True}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
@@ -1503,13 +1565,25 @@ def api_refresh_temp_email_messages(email_addr):
 def api_get_settings():
     """获取所有设置"""
     settings = get_all_settings()
-    # 隐藏密码的部分字符
+
     if 'login_password' in settings:
         pwd = settings['login_password']
         if len(pwd) > 2:
             settings['login_password_masked'] = pwd[0] + '*' * (len(pwd) - 2) + pwd[-1]
         else:
             settings['login_password_masked'] = '*' * len(pwd)
+        settings.pop('login_password', None)
+
+    if 'api_auth_key' in settings:
+        api_key = settings['api_auth_key']
+        settings['api_auth_key_masked'] = (
+            api_key[:4] + '*' * max(len(api_key) - 8, 0) + api_key[-4:]
+            if len(api_key) > 8 else
+            '*' * len(api_key)
+        ) if api_key else ''
+        settings['api_auth_key_configured'] = bool(api_key.strip())
+        settings.pop('api_auth_key', None)
+
     return jsonify({'success': True, 'settings': settings})
 
 
@@ -1535,11 +1609,20 @@ def api_update_settings():
     # 更新 GPTMail API Key
     if 'gptmail_api_key' in data:
         new_api_key = data['gptmail_api_key'].strip()
-        if new_api_key:
-            if set_setting('gptmail_api_key', new_api_key):
-                updated.append('GPTMail API Key')
-            else:
-                errors.append('更新 GPTMail API Key 失败')
+        if set_setting('gptmail_api_key', new_api_key):
+            updated.append('GPTMail API Key')
+        else:
+            errors.append('更新 GPTMail API Key 失败')
+
+    # 更新 API 访问密钥
+    if 'api_auth_key' in data:
+        new_auth_key = data['api_auth_key'].strip()
+        if new_auth_key and len(new_auth_key) < 8:
+            errors.append('API Key 长度至少为 8 位')
+        elif set_setting('api_auth_key', new_auth_key):
+            updated.append('API Key')
+        else:
+            errors.append('更新 API Key 失败')
     
     if errors:
         return jsonify({'success': False, 'error': '；'.join(errors)})
